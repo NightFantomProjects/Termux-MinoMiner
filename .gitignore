@@ -1,0 +1,15 @@
+# Local miner/configuration data
+.config/
+.local/
+config.json
+runtime.*.json
+*.log
+
+# Compiled artifacts and build output
+cpuminer
+cpuminer-minotaurx
+*.o
+*.a
+*.so
+*.dSYM/
+build/

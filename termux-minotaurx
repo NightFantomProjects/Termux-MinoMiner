@@ -1,0 +1,181 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# One-file Termux installer/launcher for Litecoin Cash MinotaurX CPU mining.
+# Builds GPL-2.0 cpuminer-multi from source; no prebuilt binaries.
+# SPDX-License-Identifier: GPL-2.0-only
+set -Eeuo pipefail
+APP="$HOME/.local/share/termux-minotaurx"
+CONF="$HOME/.config/termux-minotaurx/config.json"
+UPSTREAM_REV="5710e52b064d2077a53d3db3ae6b1a7febbec45b"
+SRC="$APP/source-${UPSTREAM_REV:0:12}"
+MINER="${PREFIX:-/data/data/com.termux/files/usr}/bin/cpuminer-minotaurx"
+BUILD_MARKER="$APP/.minotaurx-only-build-v2"
+UPSTREAM="https://github.com/litecoincash-project/cpuminer-multi.git"
+say(){ printf '\n==> %s\n' "$*"; }
+die(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+command -v pkg >/dev/null 2>&1 || die "Run this script inside Termux on Android."
+
+# Build once. A later run launches the already-installed MinotaurX-only binary.
+if [[ ! -x "$MINER" || ! -f "$BUILD_MARKER" ]]; then
+  say "Installing compiler and build dependencies"
+  pkg update -y || die "pkg update failed; check network and repositories."
+  pkg install -y git clang make autoconf automake libtool pkg-config openssl libcurl zlib python || die "Dependency installation failed."
+  mkdir -p "$APP"
+  if [[ ! -d "$SRC/.git" ]]; then
+    say "Downloading upstream source"
+    git clone --depth 1 "$UPSTREAM" "$SRC" || die "Could not clone upstream source."
+  fi
+  git -C "$SRC" fetch --depth 1 origin "$UPSTREAM_REV" || die "Could not fetch the pinned, tested upstream revision."
+  git -C "$SRC" checkout --detach FETCH_HEAD || die "Could not select the pinned upstream revision."
+
+  # Change only the upstream startup-banner donation address. This is a
+  # voluntary donation display, not a pool URL or mining-fee redirect.
+  python - "$SRC/cpu-miner.c" <<'PY'
+import pathlib,sys
+p=pathlib.Path(sys.argv[1]); s=p.read_text()
+old='CashCFfv8CmdWo6wyMGQWtmQnaToyhgsWr'
+new='CdV1cNyBjMxBTtc2tm1ih4TMCmLvbSw8dH'
+if s.count(old)==1:
+    s=s.replace(old,new,1)
+elif old not in s and s.count(new)==1:
+    pass  # Already patched from a previous build attempt.
+else:
+    raise SystemExit('Unexpected upstream donation banner; refusing an ambiguous address edit.')
+p.write_text(s)
+PY
+
+  # Retain cpuminer's pool/network/Stratum engine and the precise primitive
+  # set MinotaurX uses: 16 SPH hashes, SHA-512, and yespower. Other algo/*.c
+  # scanners are omitted. Link-only stubs satisfy the legacy dispatcher; they
+  # return failure and implement no mining algorithm.
+  python - "$SRC/Makefile.am" "$SRC/miner.h" "$SRC/algo/minotaurx-stubs.c" <<'PY'
+import pathlib,re,sys
+makefile,header,stub=map(pathlib.Path,sys.argv[1:])
+s=makefile.read_text()
+start=s.index('cpuminer_SOURCES = \\\n')
+end=s.index('\ndisable_flags =',start)
+block=s[start:end]
+entries=[
+'cpu-miner.c','util.c','api.c','sysinfos.c','uint256.cpp',
+'sha3/sph_keccak.c','sha3/sph_groestl.c','sha3/sph_skein.c','sha3/sph_bmw.c',
+'sha3/sph_jh.c','sha3/sph_shavite.c','sha3/sph_blake.c','sha3/sph_luffa.c',
+'sha3/sph_cubehash.c','sha3/sph_simd.c','sha3/sph_echo.c','sha3/sph_fugue.c',
+'sha3/sph_hamsi.c','sha3/sph_sha2.c','sha3/sph_sha2big.c','sha3/sph_shabal.c','sha3/sph_whirlpool.c',
+'algo/minotaur.c','algo/yespower/yespower.c',
+'algo/yespower/crypto/sha256.c'
+]
+if not all(x in block for x in entries): raise SystemExit('Upstream source list changed; a required MinotaurX/core file is missing.')
+# Generate scanner placeholders using exact declarations so old dispatch links.
+h=header.read_text()
+protos=re.findall(r'int\s+(scanhash_\w+)\s*\([^;]*?\);',h,re.S)
+defs=[]
+for name in sorted(set(protos)):
+    if name=='scanhash_minotaur': continue
+    m=re.search(r'int\s+'+re.escape(name)+r'\s*\([^;]*?\);',h,re.S)
+    defs.append(' '.join(m.group(0).split())[:-1]+' { return -1; }')
+defs.append('void init_quarkhash_contexts(void) { }')
+defs.extend([
+'void sha256d(unsigned char *hash, const unsigned char *data, int len) { unsigned char tmp[SHA256_DIGEST_LENGTH]; SHA256(data, (size_t)len, tmp); SHA256(tmp, sizeof(tmp), hash); }',
+'void cryptolight_hash(void *output, const void *input) { (void)input; memset(output, 0, 32); }',
+'unsigned char *scrypt_buffer_alloc(int N) { (void)N; return 0; }',
+'void cryptonight_hash(void *output, const void *input) { (void)input; memset(output, 0, 32); }',
+'void cryptonight_hash_v1(void *output, const void *input) { (void)input; memset(output, 0, 32); }',
+'void heavyhash(unsigned char *output, const unsigned char *input, int len) { (void)input; (void)len; memset(output, 0, 32); }',
+])
+stub.write_text('#include "miner.h"\n#include <string.h>\n#include <openssl/sha.h>\n/* Link-only stubs/helpers: only MinotaurX has a mining scanner. */\n'+'\n'.join(defs)+'\n')
+# util.c's optional hash-test command references every algorithm. Replace only
+# that diagnostic function with a clear unsupported notice; mining/runtime
+# utilities remain untouched.
+u=makefile.parent/'util.c'; text=u.read_text(); marker='void print_hash_tests(void)'; pos=text.find(marker)
+if pos < 0: raise SystemExit('Could not locate optional all-algorithm hash test function')
+brace=text.find('{',pos); depth=0; close=-1
+for i in range(brace,len(text)):
+    if text[i]=='{': depth+=1
+    elif text[i]=='}':
+        depth-=1
+        if depth==0: close=i+1; break
+if close<0: raise SystemExit('Could not parse hash-test function body')
+text=text[:pos]+marker+' { fprintf(stderr, "Hash tests are disabled in this MinotaurX-only build.\\n"); }'+text[close:]
+u.write_text(text)
+entries.append('algo/minotaurx-stubs.c')
+lines=['cpuminer_SOURCES = \\']
+for i,e in enumerate(entries):
+    lines.append('  '+e+(' \\' if i < len(entries)-1 else ''))
+s=s[:start]+'\n'.join(lines)+s[end:]
+makefile.write_text(s)
+PY
+
+  cd "$SRC"
+  say "Generating build files for MinotaurX-only sources"
+  ./autogen.sh || die "autogen.sh failed."
+  CFLAGS="-O2" ./configure --disable-assembly --with-crypto --with-curl || die "configure failed on this device ABI."
+  make clean >/dev/null 2>&1 || true
+  say "Compiling reduced miner (one build job to limit heat and memory)"
+  make -j1 || die "Reduced MinotaurX build failed. Send the final 40 lines of output."
+  [[ -x ./cpuminer ]] || die "Build finished without cpuminer executable."
+  install -m 0755 ./cpuminer "$MINER" || die "Could not install miner under Termux prefix."
+  touch "$BUILD_MARKER"
+  say "MinotaurX-only miner installed. Other scanner stubs do not mine."
+fi
+
+mkdir -p "$(dirname "$CONF")" "$APP"; chmod 700 "$(dirname "$CONF")" "$APP"
+if [[ ! -f "$CONF" ]]; then
+  say "First-run pool setup. Use a Litecoin Cash payout address and a MinotaurX pool."
+  echo "Never enter a seed phrase, private key, exchange password, or API key."
+  read -r -p 'Pool URL (stratum+tcp://host:port): ' POOL_URL
+  read -r -p 'LCC wallet / pool login (optionally .worker): ' WALLET
+  read -r -p 'Pool password (often x; input visible): ' POOL_PASS
+  read -r -p 'CPU threads [8]: ' THREADS; THREADS="${THREADS:-8}"
+  read -r -p 'Duty percentage 10-100 [20]: ' DUTY; DUTY="${DUTY:-20}"
+  read -r -p 'Duty cycle seconds 20-600 [60]: ' CYCLE; CYCLE="${CYCLE:-60}"
+  python - "$CONF" "$POOL_URL" "$WALLET" "$POOL_PASS" "$THREADS" "$DUTY" "$CYCLE" <<'PY'
+import json,sys
+p,url,user,pw,threads,duty,cycle=sys.argv[1:]
+with open(p,'w') as f:
+    json.dump({'algo':'minotaurx','url':url,'user':user,'pass':pw,'threads':int(threads),'duty_percent':int(duty),'cycle_seconds':int(cycle)},f,indent=2)
+    f.write('\n')
+PY
+  chmod 600 "$CONF"
+fi
+command -v python >/dev/null 2>&1 || die "Install Python with: pkg install python"
+mapfile -t S < <(python - "$CONF" <<'PY'
+import json,sys
+try:
+ c=json.load(open(sys.argv[1],encoding='utf8')); u=c['url']; n=c['user']; p=c.get('pass','x')
+ t=int(c.get('threads',8)); d=int(c.get('duty_percent',20)); z=int(c.get('cycle_seconds',60))
+except Exception as e: raise SystemExit('Invalid config: '+str(e))
+if c.get('algo')!='minotaurx': raise SystemExit('Only minotaurx is supported.')
+if not u.startswith(('stratum+tcp://','stratum+ssl://')): raise SystemExit('Pool URL must start stratum+tcp:// or stratum+ssl://')
+if any(x in u+n for x in ('POOL_HOST','YOUR_WALLET','example:')): raise SystemExit('Replace example pool and wallet placeholders.')
+if not n or not p: raise SystemExit('Pool login/password cannot be empty.')
+if not 1<=t<=64 or not 10<=d<=100 or not 20<=z<=600: raise SystemExit('threads 1-64, duty 10-100, cycle 20-600 required.')
+for x in (u,n,p,str(t),str(d),str(z)): print(x)
+PY
+) || die "Could not parse valid MinotaurX configuration."
+URL="${S[0]}"; USER="${S[1]}"; PASS="${S[2]}"; THREADS="${S[3]}"; DUTY="${S[4]}"; CYCLE="${S[5]}"
+CPU="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+(( THREADS <= CPU )) || die "Device reports $CPU CPUs; lower threads in $CONF."
+RUNTIME="$(mktemp "$APP/runtime.XXXXXX.json")"; chmod 600 "$RUNTIME"
+python - "$RUNTIME" "$URL" "$USER" "$PASS" "$THREADS" <<'PY'
+import json,sys
+p,u,n,w,t=sys.argv[1:]
+with open(p,'w') as f: json.dump({'algo':'minotaurx','url':u,'user':n,'pass':w,'threads':int(t)},f)
+PY
+LOG="$APP/miner.log"; PID=""
+cleanup(){
+  if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then kill -CONT "$PID" 2>/dev/null || true; kill -TERM "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; fi
+  rm -f "$RUNTIME"; echo "Stopped. Log: $LOG"
+}
+trap cleanup EXIT INT TERM
+say "Starting MinotaurX: $THREADS thread(s), $DUTY% duty. Ctrl+C stops."
+echo "Miner output and pool/hash-rate status follow. Keep Termux open. Stop if the phone gets hot."
+"$MINER" -c "$RUNTIME" > >(tee -a "$LOG") 2>&1 & PID=$!
+ON=$(( CYCLE * DUTY / 100 )); OFF=$(( CYCLE - ON )); (( ON > 0 )) || ON=1
+while kill -0 "$PID" 2>/dev/null; do
+  for ((elapsed=0; elapsed<ON; elapsed+=5)); do kill -0 "$PID" 2>/dev/null || break; sleep 5; done
+  kill -0 "$PID" 2>/dev/null || break
+  if (( OFF > 0 )); then
+    echo "[$(date '+%H:%M:%S')] duty pause ${OFF}s; $(uptime 2>/dev/null | sed 's/^.*load average:/load:/')"
+    kill -STOP "$PID" 2>/dev/null || break; sleep "$OFF"; kill -CONT "$PID" 2>/dev/null || break
+  fi
+done
+wait "$PID"
